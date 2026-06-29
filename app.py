@@ -15,6 +15,11 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+try:
+    from streamlit_mic_recorder import mic_recorder
+except ImportError:
+    mic_recorder = None
+
 from agents.demo_data import format_demo_transcript
 from agents.diarizer import transcribe_audio, format_diarized_transcript
 from agents.language_handler import translate_segments, best_effort_english_fallback
@@ -55,6 +60,9 @@ BRIEFING_PAGE = "Pre-Meeting Briefing"
 ACTION_ITEMS_PAGE = "Action Items"
 DATA_MANAGER_PAGE = "Data Manager"
 PAGES = [HOME_PAGE, LIVE_PAGE, BRIEFING_PAGE, ACTION_ITEMS_PAGE, DATA_MANAGER_PAGE]
+DEMO_SIMULATION_MODE = "Demo Simulation"
+MICROPHONE_AUDIO_MODE = "Microphone / Audio Input"
+SYSTEM_AUDIO_MODE = "System Audio Input"
 
 
 class RecordedAudio:
@@ -64,6 +72,18 @@ class RecordedAudio:
 
     def getvalue(self) -> bytes:
         return self._data
+
+
+def audio_mime_type(name: str, default: str = "audio/wav") -> str:
+    suffix = Path(name or "").suffix.lower()
+    return {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".mp4": "audio/mp4",
+        ".webm": "audio/webm",
+        ".ogg": "audio/ogg",
+    }.get(suffix, default)
 
 
 def show_recorded_audio(audio_file, mime_type: str = "audio/webm"):
@@ -236,7 +256,11 @@ def _friendly_audio_error(exc: Exception) -> str:
     return message
 
 
-def _wav_bytes_from_samples(data, sample_rate: int) -> bytes:
+SILENT_AUDIO_PEAK_THRESHOLD = 0.0001
+SILENT_AUDIO_RMS_THRESHOLD = 0.00001
+
+
+def _prepare_audio_samples(data):
     if data.size == 0:
         raise RuntimeError("System audio recording was empty.")
 
@@ -244,6 +268,43 @@ def _wav_bytes_from_samples(data, sample_rate: int) -> bytes:
         data = data.reshape(-1, 1)
     if data.shape[1] > 2:
         data = data[:, :2]
+    return data
+
+
+def _audio_signal_stats(data, sample_rate: int) -> dict:
+    data = _prepare_audio_samples(data)
+    abs_data = np.abs(data)
+    peak = float(np.max(abs_data)) if abs_data.size else 0.0
+    rms = float(np.sqrt(np.mean(np.square(data)))) if data.size else 0.0
+    nonzero_ratio = float(np.count_nonzero(abs_data > 0.00001) / abs_data.size) if abs_data.size else 0.0
+    return {
+        "duration_seconds": round(float(data.shape[0] / sample_rate), 2),
+        "channels": int(data.shape[1]),
+        "peak": peak,
+        "rms": rms,
+        "nonzero_ratio": nonzero_ratio,
+    }
+
+
+def _audio_is_silent(stats: dict) -> bool:
+    return (
+        float(stats.get("peak", 0.0)) < SILENT_AUDIO_PEAK_THRESHOLD
+        and float(stats.get("rms", 0.0)) < SILENT_AUDIO_RMS_THRESHOLD
+    )
+
+
+def _format_audio_signal_stats(stats: dict | None) -> str:
+    if not stats:
+        return "Signal level unavailable."
+    return (
+        f"Duration {stats.get('duration_seconds', 0):.1f}s, "
+        f"peak {stats.get('peak', 0):.5f}, "
+        f"RMS {stats.get('rms', 0):.5f}"
+    )
+
+
+def _wav_bytes_from_samples(data, sample_rate: int) -> bytes:
+    data = _prepare_audio_samples(data)
 
     pcm = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
     buffer = io.BytesIO()
@@ -264,6 +325,24 @@ def _initialize_com_for_audio_thread() -> bool:
     raise OSError(f"Windows audio initialization failed: 0x{result & 0xffffffff:08x}")
 
 
+def get_system_audio_device_summary() -> dict:
+    com_initialized = False
+    try:
+        com_initialized = _initialize_com_for_audio_thread()
+        sc, _ = _import_soundcard_for_audio_thread()
+        speaker, loopbacks = _system_loopback_devices(sc)
+        return {
+            "speaker": getattr(speaker, "name", "default speaker"),
+            "loopbacks": [getattr(loopback, "name", "system audio") for loopback in loopbacks],
+            "error": "",
+        }
+    except Exception as exc:
+        return {"speaker": "", "loopbacks": [], "error": _friendly_audio_error(exc)}
+    finally:
+        if com_initialized:
+            ctypes.windll.ole32.CoUninitialize()
+
+
 def _system_audio_worker(job: dict, sample_rate: int = 48000):
     com_initialized = False
     try:
@@ -282,7 +361,10 @@ def _system_audio_worker(job: dict, sample_rate: int = 48000):
             chunks = []
             try:
                 while not job["stop_event"].is_set():
-                    chunks.append(loopback.record(samplerate=sample_rate, numframes=chunk_frames))
+                    chunk = loopback.record(samplerate=sample_rate, numframes=chunk_frames)
+                    chunks.append(chunk)
+                    job["last_peak"] = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+                    job["frames_captured"] = int(sum(part.shape[0] for part in chunks if part.size))
                 break
             except Exception as exc:
                 errors.append(f"{job['device']}: {_friendly_audio_error(exc)}")
@@ -297,6 +379,16 @@ def _system_audio_worker(job: dict, sample_rate: int = 48000):
             raise RuntimeError("No system audio was captured.")
 
         data = np.concatenate(chunks, axis=0)
+        stats = _audio_signal_stats(data, sample_rate)
+        job["signal_stats"] = stats
+        if _audio_is_silent(stats):
+            job["error"] = (
+                f"No system audio signal was detected from {job['device']}. "
+                "Make sure the meeting audio is playing through this Windows output device, "
+                "then record again."
+            )
+            job["status"] = "silent"
+            return
         job["bytes"] = _wav_bytes_from_samples(data, sample_rate)
         job["name"] = "system_audio_recording.wav"
         job["status"] = "complete"
@@ -1058,6 +1150,8 @@ def logout():
         "live_meeting_title",
         "live_meeting_source",
         "pending_page",
+        "microphone_recording",
+        "live_mic_recorder_output",
         "system_audio_recording",
         "system_audio_job",
     ):
@@ -1348,11 +1442,11 @@ elif page == LIVE_PAGE:
             <div class="live-kicker">Live meeting workspace</div>
             <h1 class="live-title">Capture the call. <span>Leave with action.</span></h1>
             <p class="live-copy">
-                Run the demo path or record real system audio from the meeting.
+                Run the demo path or record real audio from the meeting.
                 MeetingOps turns the discussion into an English transcript, summary, and saved action items.
             </p>
             <div class="live-status-grid">
-                <div class="live-status"><b>Input</b><span>Demo or direct system audio recording.</span></div>
+                <div class="live-status"><b>Input</b><span>Demo, microphone, upload, or system audio recording.</span></div>
                 <div class="live-status"><b>AI pass</b><span>Diarize, translate, summarize, and extract owners.</span></div>
                 <div class="live-status"><b>Output</b><span>Saved meeting record with pending follow-ups.</span></div>
             </div>
@@ -1418,9 +1512,9 @@ elif page == LIVE_PAGE:
             """,
             unsafe_allow_html=True,
         )
-        mode = st.radio("Mode", ["🎭 Demo Simulation", "🎧 System Audio Input"], horizontal=True)
+        mode = st.radio("Mode", [DEMO_SIMULATION_MODE, MICROPHONE_AUDIO_MODE, SYSTEM_AUDIO_MODE], horizontal=True)
 
-    if mode == "🎭 Demo Simulation":
+    if mode == DEMO_SIMULATION_MODE:
         st.markdown('<div class="live-section-title">Demo Transcript Preview</div>', unsafe_allow_html=True)
         st.markdown(
             '<div class="live-section-copy">A ready-made mixed-language meeting sample for a fast end-to-end run.</div>',
@@ -1431,6 +1525,73 @@ elif page == LIVE_PAGE:
         audio = None
         manual_transcript = ""
         use_manual_transcript = False
+    elif mode == MICROPHONE_AUDIO_MODE:
+        st.markdown('<div class="live-section-title">Capture Input</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="live-section-copy">Record browser microphone audio, upload a saved recording, or use verified test audio.</div>',
+            unsafe_allow_html=True,
+        )
+        st.info("For live room audio, allow microphone access in Edge/Chrome for localhost. For Teams/Meet audio, upload a recording if browser microphone capture is blocked.")
+        audio = None
+        manual_transcript = ""
+        use_manual_transcript = False
+
+        if mic_recorder is None:
+            st.warning("Microphone recorder package is not installed. Upload audio or use verified test audio.")
+        else:
+            mic_audio = mic_recorder(
+                start_prompt="Record meeting audio",
+                stop_prompt="Stop recording",
+                just_once=False,
+                use_container_width=True,
+                format="webm",
+                key="live_mic_recorder",
+            )
+            if mic_audio and mic_audio.get("bytes"):
+                audio_format = mic_audio.get("format", "webm")
+                st.session_state.microphone_recording = {
+                    "bytes": mic_audio["bytes"],
+                    "name": f"microphone_recording.{audio_format}",
+                }
+
+        uploaded_audio = st.file_uploader(
+            "Or upload recorded audio",
+            type=["wav", "mp3", "m4a", "mp4", "webm", "ogg"],
+        )
+        if uploaded_audio is not None:
+            audio = uploaded_audio
+            st.success(f"Uploaded audio ready: {uploaded_audio.name}")
+            st.audio(uploaded_audio.getvalue(), format=audio_mime_type(uploaded_audio.name))
+        else:
+            recorded_mic_audio = st.session_state.get("microphone_recording")
+            if recorded_mic_audio:
+                audio = RecordedAudio(recorded_mic_audio["bytes"], recorded_mic_audio["name"])
+                st.success("Microphone/test audio ready.")
+                st.audio(recorded_mic_audio["bytes"], format=audio_mime_type(recorded_mic_audio["name"], "audio/webm"))
+
+        if st.button("Use verified test audio"):
+            test_audio_path = Path("test_meeting_audio.mp3")
+            if test_audio_path.exists():
+                st.session_state.microphone_recording = {
+                    "bytes": test_audio_path.read_bytes(),
+                    "name": test_audio_path.name,
+                }
+                st.rerun()
+            else:
+                st.error("Verified test audio file is missing.")
+
+        manual_transcript = st.text_area(
+            "Emergency transcript fallback",
+            placeholder="Paste meeting transcript here if audio capture is blocked.",
+        )
+        use_manual_transcript = st.checkbox(
+            "Use pasted transcript instead of audio",
+            disabled=not manual_transcript.strip(),
+        )
+        if use_manual_transcript:
+            audio = None
+
+        run = st.button("Process Audio", type="primary", disabled=audio is None and not use_manual_transcript)
     else:
         st.markdown('<div class="live-section-title">Capture Input</div>', unsafe_allow_html=True)
         st.markdown(
@@ -1443,6 +1604,11 @@ elif page == LIVE_PAGE:
             st.info("This records audio from the default speaker/output device. Keep Meet audio playing on this computer while recording.")
         elif meeting_source == "Slack Huddle":
             st.info("This records audio from the default speaker/output device. Keep Slack audio playing on this computer while recording.")
+        device_summary = get_system_audio_device_summary()
+        if device_summary.get("error"):
+            st.error(device_summary["error"])
+        elif device_summary.get("speaker"):
+            st.caption(f"Windows output being recorded: {device_summary['speaker']}")
         audio = None
         manual_transcript = ""
         use_manual_transcript = False
@@ -1465,10 +1631,13 @@ elif page == LIVE_PAGE:
                             "bytes": stopped_job["bytes"],
                             "name": stopped_job["name"],
                             "device": stopped_job.get("device", "default speaker"),
+                            "signal_stats": stopped_job.get("signal_stats", {}),
                         }
                         st.session_state.pop("system_audio_job", None)
                     else:
                         st.error(stopped_job.get("error", "System audio recording failed."))
+                        if stopped_job.get("signal_stats"):
+                            st.caption(_format_audio_signal_stats(stopped_job["signal_stats"]))
                 except Exception as exc:
                     st.error(str(exc))
                 st.rerun()
@@ -1476,15 +1645,20 @@ elif page == LIVE_PAGE:
         if is_recording:
             elapsed = int(time.time() - active_job.get("started_at", time.time()))
             device_label = active_job.get("device") or "system audio"
-            st.warning(f"Recording {device_label}... {elapsed} seconds. Click Stop Recording when the meeting section is done.")
-        elif active_job and active_job.get("status") == "error":
+            signal = active_job.get("last_peak")
+            level_text = f" Last peak: {signal:.5f}." if signal is not None else ""
+            st.warning(f"Recording {device_label}... {elapsed} seconds.{level_text} Click Stop Recording when the meeting section is done.")
+        elif active_job and active_job.get("status") in {"error", "silent"}:
             st.error(active_job.get("error", "System audio recording failed."))
+            if active_job.get("signal_stats"):
+                st.caption(_format_audio_signal_stats(active_job["signal_stats"]))
             st.session_state.pop("system_audio_job", None)
 
         recorded_system_audio = st.session_state.get("system_audio_recording")
         if recorded_system_audio:
             audio = RecordedAudio(recorded_system_audio["bytes"], recorded_system_audio["name"])
             st.success(f"Recording ready from {recorded_system_audio.get('device', 'system audio')}.")
+            st.caption(_format_audio_signal_stats(recorded_system_audio.get("signal_stats")))
             st.audio(recorded_system_audio["bytes"], format="audio/wav")
 
         run = st.button("Process Meeting", type="primary", disabled=audio is None or is_recording)
@@ -1492,10 +1666,10 @@ elif page == LIVE_PAGE:
     if run:
         progress = st.progress(0)
         status = st.empty()
-        live_audio_mode = not demo_mode and mode != "🎭 Demo Simulation"
+        live_audio_mode = not demo_mode and mode != DEMO_SIMULATION_MODE
 
         if live_audio_mode and audio is None and not use_manual_transcript:
-            status.error("Record system audio before processing the meeting.")
+            status.error("Record, upload, or paste meeting content before processing.")
             st.stop()
 
         if live_audio_mode and not os.getenv("OPENAI_API_KEY"):
@@ -1507,7 +1681,7 @@ elif page == LIVE_PAGE:
             if live_audio_mode and use_manual_transcript:
                 segments = transcript_segments_from_text(manual_transcript)
             else:
-                segments = transcribe_audio(audio, demo_mode=(demo_mode or mode == "🎭 Demo Simulation"))
+                segments = transcribe_audio(audio, demo_mode=(demo_mode or mode == DEMO_SIMULATION_MODE))
         except Exception as exc:
             status.error(str(exc))
             st.stop()
