@@ -62,7 +62,10 @@ DATA_MANAGER_PAGE = "Data Manager"
 PAGES = [HOME_PAGE, LIVE_PAGE, BRIEFING_PAGE, ACTION_ITEMS_PAGE, DATA_MANAGER_PAGE]
 DEMO_SIMULATION_MODE = "Demo Simulation"
 MICROPHONE_AUDIO_MODE = "Microphone / Audio Input"
-SYSTEM_AUDIO_MODE = "System Audio Input"
+
+
+def is_closed_action_status(status: str) -> bool:
+    return str(status or "").strip().upper() in {"CLOSED", "DONE", "COMPLETE", "COMPLETED"}
 
 
 class RecordedAudio:
@@ -1446,7 +1449,7 @@ elif page == LIVE_PAGE:
                 MeetingOps turns the discussion into an English transcript, summary, and saved action items.
             </p>
             <div class="live-status-grid">
-                <div class="live-status"><b>Input</b><span>Demo, microphone, upload, or system audio recording.</span></div>
+                <div class="live-status"><b>Input</b><span>Demo, microphone, or uploaded audio.</span></div>
                 <div class="live-status"><b>AI pass</b><span>Diarize, translate, summarize, and extract owners.</span></div>
                 <div class="live-status"><b>Output</b><span>Saved meeting record with pending follow-ups.</span></div>
             </div>
@@ -1512,7 +1515,7 @@ elif page == LIVE_PAGE:
             """,
             unsafe_allow_html=True,
         )
-        mode = st.radio("Mode", [DEMO_SIMULATION_MODE, MICROPHONE_AUDIO_MODE, SYSTEM_AUDIO_MODE], horizontal=True)
+        mode = st.radio("Mode", [DEMO_SIMULATION_MODE, MICROPHONE_AUDIO_MODE], horizontal=True)
 
     if mode == DEMO_SIMULATION_MODE:
         st.markdown('<div class="live-section-title">Demo Transcript Preview</div>', unsafe_allow_html=True)
@@ -1528,7 +1531,7 @@ elif page == LIVE_PAGE:
     elif mode == MICROPHONE_AUDIO_MODE:
         st.markdown('<div class="live-section-title">Capture Input</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="live-section-copy">Record browser microphone audio, upload a saved recording, or use verified test audio.</div>',
+            '<div class="live-section-copy">Record browser microphone audio or upload a saved recording.</div>',
             unsafe_allow_html=True,
         )
         st.info("For live room audio, allow microphone access in Edge/Chrome for localhost. For Teams/Meet audio, upload a recording if browser microphone capture is blocked.")
@@ -1537,7 +1540,7 @@ elif page == LIVE_PAGE:
         use_manual_transcript = False
 
         if mic_recorder is None:
-            st.warning("Microphone recorder package is not installed. Upload audio or use verified test audio.")
+            st.warning("Microphone recorder package is not installed. Upload audio to continue.")
         else:
             mic_audio = mic_recorder(
                 start_prompt="Record meeting audio",
@@ -1566,19 +1569,8 @@ elif page == LIVE_PAGE:
             recorded_mic_audio = st.session_state.get("microphone_recording")
             if recorded_mic_audio:
                 audio = RecordedAudio(recorded_mic_audio["bytes"], recorded_mic_audio["name"])
-                st.success("Microphone/test audio ready.")
+                st.success("Microphone audio ready.")
                 st.audio(recorded_mic_audio["bytes"], format=audio_mime_type(recorded_mic_audio["name"], "audio/webm"))
-
-        if st.button("Use verified test audio"):
-            test_audio_path = Path("test_meeting_audio.mp3")
-            if test_audio_path.exists():
-                st.session_state.microphone_recording = {
-                    "bytes": test_audio_path.read_bytes(),
-                    "name": test_audio_path.name,
-                }
-                st.rerun()
-            else:
-                st.error("Verified test audio file is missing.")
 
         manual_transcript = st.text_area(
             "Emergency transcript fallback",
@@ -1592,77 +1584,6 @@ elif page == LIVE_PAGE:
             audio = None
 
         run = st.button("Process Audio", type="primary", disabled=audio is None and not use_manual_transcript)
-    else:
-        st.markdown('<div class="live-section-title">Capture Input</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="live-section-copy">Record the computer system audio directly, then process it into transcript, summary, and action items.</div>',
-            unsafe_allow_html=True,
-        )
-        if meeting_source == "MS Teams":
-            st.info("This records audio from the default speaker/output device. Keep Teams audio playing on this computer while recording.")
-        elif meeting_source == "Google Chat / Meet":
-            st.info("This records audio from the default speaker/output device. Keep Meet audio playing on this computer while recording.")
-        elif meeting_source == "Slack Huddle":
-            st.info("This records audio from the default speaker/output device. Keep Slack audio playing on this computer while recording.")
-        device_summary = get_system_audio_device_summary()
-        if device_summary.get("error"):
-            st.error(device_summary["error"])
-        elif device_summary.get("speaker"):
-            st.caption(f"Windows output being recorded: {device_summary['speaker']}")
-        audio = None
-        manual_transcript = ""
-        use_manual_transcript = False
-
-        active_job = st.session_state.get("system_audio_job")
-        is_recording = bool(active_job and active_job.get("status") == "recording")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Start Recording", type="primary", disabled=is_recording):
-                st.session_state.pop("system_audio_recording", None)
-                st.session_state.system_audio_job = start_system_audio_recording()
-                st.rerun()
-        with c2:
-            if st.button("Stop Recording", disabled=not is_recording):
-                try:
-                    stopped_job = stop_system_audio_recording(active_job)
-                    if stopped_job.get("status") == "complete":
-                        st.session_state.system_audio_recording = {
-                            "bytes": stopped_job["bytes"],
-                            "name": stopped_job["name"],
-                            "device": stopped_job.get("device", "default speaker"),
-                            "signal_stats": stopped_job.get("signal_stats", {}),
-                        }
-                        st.session_state.pop("system_audio_job", None)
-                    else:
-                        st.error(stopped_job.get("error", "System audio recording failed."))
-                        if stopped_job.get("signal_stats"):
-                            st.caption(_format_audio_signal_stats(stopped_job["signal_stats"]))
-                except Exception as exc:
-                    st.error(str(exc))
-                st.rerun()
-
-        if is_recording:
-            elapsed = int(time.time() - active_job.get("started_at", time.time()))
-            device_label = active_job.get("device") or "system audio"
-            signal = active_job.get("last_peak")
-            level_text = f" Last peak: {signal:.5f}." if signal is not None else ""
-            st.warning(f"Recording {device_label}... {elapsed} seconds.{level_text} Click Stop Recording when the meeting section is done.")
-        elif active_job and active_job.get("status") in {"error", "silent"}:
-            st.error(active_job.get("error", "System audio recording failed."))
-            if active_job.get("signal_stats"):
-                st.caption(_format_audio_signal_stats(active_job["signal_stats"]))
-            st.session_state.pop("system_audio_job", None)
-
-        recorded_system_audio = st.session_state.get("system_audio_recording")
-        if recorded_system_audio:
-            audio = RecordedAudio(recorded_system_audio["bytes"], recorded_system_audio["name"])
-            st.success(f"Recording ready from {recorded_system_audio.get('device', 'system audio')}.")
-            st.caption(_format_audio_signal_stats(recorded_system_audio.get("signal_stats")))
-            st.audio(recorded_system_audio["bytes"], format="audio/wav")
-
-        run = st.button("Process Meeting", type="primary", disabled=audio is None or is_recording)
-
     if run:
         progress = st.progress(0)
         status = st.empty()
@@ -2035,78 +1956,121 @@ elif page == DATA_MANAGER_PAGE:
                 for meeting in visible_meetings[:25]
             ]
             selected_from_table = None
+            meeting_table_key = f"meeting_records_table_{st.session_state.get('meeting_records_table_reset', 0)}"
             table_event = st.dataframe(
                 meeting_rows,
                 use_container_width=True,
                 hide_index=True,
                 on_select="rerun",
-                selection_mode="single-row",
-                key="meeting_records_table",
+                selection_mode="multi-row",
+                key=meeting_table_key,
             )
             selected_rows = table_event.selection.rows if table_event and table_event.selection else []
+            selected_rows = [
+                row_index
+                for row_index in selected_rows
+                if isinstance(row_index, int) and 0 <= row_index < len(meeting_rows)
+            ]
+            selected_meeting_ids = [
+                meeting_rows[row_index]["meeting_id"]
+                for row_index in selected_rows
+            ]
             if selected_rows:
                 selected_from_table = meeting_rows[selected_rows[0]]["meeting_id"]
             if len(visible_meetings) > 25:
                 st.caption(f"Showing 25 of {len(visible_meetings)} matching meetings. Refine the search to narrow the list.")
 
+            if selected_meeting_ids:
+                st.caption(f"{len(selected_meeting_ids)} meeting record(s) selected.")
+            bulk_delete_col, bulk_confirm_col = st.columns([0.3, 0.7])
+            with bulk_confirm_col:
+                selected_signature = abs(hash(tuple(selected_meeting_ids)))
+                bulk_delete_confirm = st.checkbox(
+                    "I understand this will delete the selected meeting records",
+                    disabled=not selected_meeting_ids,
+                    key=f"bulk_delete_meetings_confirm_{selected_signature}",
+                )
+            with bulk_delete_col:
+                bulk_delete_meetings = st.button(
+                    f"Delete selected ({len(selected_meeting_ids)})",
+                    disabled=not selected_meeting_ids,
+                    key="bulk_delete_meetings",
+                )
+
+            if bulk_delete_meetings:
+                if not bulk_delete_confirm:
+                    st.warning("Tick the bulk delete confirmation checkbox first.")
+                else:
+                    deleted_count = 0
+                    failed_ids = []
+                    for meeting_id in selected_meeting_ids:
+                        if delete_meeting(meeting_id):
+                            deleted_count += 1
+                        else:
+                            failed_ids.append(meeting_id)
+                    st.session_state["meeting_records_table_reset"] = (
+                        st.session_state.get("meeting_records_table_reset", 0) + 1
+                    )
+                    if st.session_state.get("data_manager_selected_meeting_id") in selected_meeting_ids:
+                        st.session_state.pop("data_manager_selected_meeting_id", None)
+                    if failed_ids:
+                        st.error(
+                            f"Deleted {deleted_count} meeting record(s), but could not delete: {', '.join(failed_ids)}"
+                        )
+                    else:
+                        st.success(f"Deleted {deleted_count} meeting record(s).")
+                    st.rerun()
+
             meeting_ids = [meeting["meeting_id"] for meeting in visible_meetings]
-            saved_meeting_id = st.session_state.get("data_manager_selected_meeting_id")
-            if selected_from_table in meeting_ids:
-                default_index = meeting_ids.index(selected_from_table)
-            elif saved_meeting_id in meeting_ids:
-                default_index = meeting_ids.index(saved_meeting_id)
+            if not selected_from_table:
+                st.info("Select a meeting row from the table to edit or delete a single record.")
             else:
-                default_index = 0
-            selected_meeting_id = st.selectbox(
-                "Selected meeting for details/editor",
-                meeting_ids,
-                index=default_index,
-                format_func=lambda meeting_id: next(
-                    (
-                        f"{row.get('created_at', '')} - {row.get('meeting_title') or meeting_id}"
-                        for row in visible_meetings
-                        if row["meeting_id"] == meeting_id
-                    ),
-                    meeting_id,
-                ),
-            )
-            st.session_state.data_manager_selected_meeting_id = selected_meeting_id
-            meeting_record = next(row for row in meetings if row["meeting_id"] == selected_meeting_id)
-            parsed_meeting = parse_meeting_document(
-                meeting_record.get("document", ""),
-                meeting_record.get("metadata", {}),
-            )
+                selected_meeting_id = selected_from_table
+                st.session_state.data_manager_selected_meeting_id = selected_meeting_id
+                meeting_record = next(row for row in meetings if row["meeting_id"] == selected_meeting_id)
+                parsed_meeting = parse_meeting_document(
+                    meeting_record.get("document", ""),
+                    meeting_record.get("metadata", {}),
+                )
 
-            with st.form(f"meeting_editor_{selected_meeting_id}"):
-                edited_title = st.text_input("Meeting title", value=parsed_meeting["title"])
-                edited_source = st.text_input("Source", value=parsed_meeting["source"])
-                edited_summary = st.text_area("Summary", value=parsed_meeting["summary"], height=160)
-                edited_transcript = st.text_area("Transcript", value=parsed_meeting["transcript"], height=260)
-                delete_meeting_confirm = st.checkbox("I understand this will delete this meeting record")
-                save_meeting_changes = st.form_submit_button("Save meeting changes", type="primary")
-                remove_meeting = st.form_submit_button("Delete meeting")
+                with st.form(f"meeting_editor_{selected_meeting_id}"):
+                    st.caption(f"Editing selected meeting: {selected_meeting_id}")
+                    edited_title = st.text_input("Meeting title", value=parsed_meeting["title"])
+                    edited_source = st.text_input("Source", value=parsed_meeting["source"])
+                    edited_summary = st.text_area("Summary", value=parsed_meeting["summary"], height=160)
+                    edited_transcript = st.text_area("Transcript", value=parsed_meeting["transcript"], height=260)
+                    save_meeting_changes = st.form_submit_button("Save meeting changes", type="primary")
+                    delete_meeting_col, delete_meeting_confirm_col = st.columns([0.28, 0.72])
+                    with delete_meeting_col:
+                        remove_meeting = st.form_submit_button("Delete meeting")
+                    with delete_meeting_confirm_col:
+                        delete_meeting_confirm = st.checkbox("I understand this will delete this meeting record")
 
-            if save_meeting_changes:
-                if update_meeting(
-                    selected_meeting_id,
-                    edited_title,
-                    edited_summary,
-                    edited_transcript,
-                    source=edited_source,
-                ):
-                    st.success("Meeting record updated.")
-                    st.rerun()
-                else:
-                    st.error("Could not update meeting record.")
+                if save_meeting_changes:
+                    if update_meeting(
+                        selected_meeting_id,
+                        edited_title,
+                        edited_summary,
+                        edited_transcript,
+                        source=edited_source,
+                    ):
+                        st.success("Meeting record updated.")
+                        st.rerun()
+                    else:
+                        st.error("Could not update meeting record.")
 
-            if remove_meeting:
-                if not delete_meeting_confirm:
-                    st.warning("Tick the delete confirmation checkbox first.")
-                elif delete_meeting(selected_meeting_id):
-                    st.success("Meeting record deleted.")
-                    st.rerun()
-                else:
-                    st.error("Could not delete meeting record.")
+                if remove_meeting:
+                    if not delete_meeting_confirm:
+                        st.warning("Tick the delete confirmation checkbox first.")
+                    elif delete_meeting(selected_meeting_id):
+                        st.session_state["meeting_records_table_reset"] = (
+                            st.session_state.get("meeting_records_table_reset", 0) + 1
+                        )
+                        st.session_state.pop("data_manager_selected_meeting_id", None)
+                        st.success("Meeting record deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Could not delete meeting record.")
 
     with action_tab:
         st.markdown('<div class="admin-section-title">Action Item Records</div>', unsafe_allow_html=True)
@@ -2124,13 +2088,30 @@ elif page == DATA_MANAGER_PAGE:
             ),
             selected_meeting_for_items,
         )
-        include_closed = st.checkbox("Show closed action items", value=True)
+        action_status_filter = st.radio(
+            "Action item status",
+            ["All", "Active only", "Closed only"],
+            horizontal=True,
+            key="data_manager_action_status_filter",
+        )
         filter_to_selected_meeting = st.checkbox(
             "Only show action items for the selected meeting",
             value=bool(selected_meeting_for_items),
             disabled=not bool(selected_meeting_for_items),
         )
-        action_items = list_action_items(include_closed=include_closed)
+        action_items = list_action_items(include_closed=True)
+        if action_status_filter == "Active only":
+            action_items = [
+                item
+                for item in action_items
+                if not is_closed_action_status(item.get("status", "OPEN"))
+            ]
+        elif action_status_filter == "Closed only":
+            action_items = [
+                item
+                for item in action_items
+                if is_closed_action_status(item.get("status", "OPEN"))
+            ]
         if filter_to_selected_meeting and selected_meeting_for_items:
             action_items = [
                 item
@@ -2148,72 +2129,157 @@ elif page == DATA_MANAGER_PAGE:
         if not action_items:
             if filter_to_selected_meeting and selected_meeting_for_items:
                 st.info("No action items are linked to the selected meeting.")
+            elif action_status_filter == "Closed only":
+                st.info("No closed action items found.")
+            elif action_status_filter == "Active only":
+                st.info("No active action items found.")
             else:
                 st.info("No action items found.")
         else:
-            selected_item_id = st.selectbox(
-                "Select action item",
-                [item["item_id"] for item in action_items],
-                format_func=lambda item_id: next(
-                    (
-                        f"{row.get('status', 'OPEN')} - {row.get('assignee') or 'Unassigned'} - {row.get('description') or item_id}"
-                        for row in action_items
-                        if row["item_id"] == item_id
-                    ),
-                    item_id,
-                ),
-            )
-            item_record = next(row for row in action_items if row["item_id"] == selected_item_id)
-
-            priority_options = ["HIGH", "MEDIUM", "LOW"]
-            status_options = ["OPEN", "CLOSED"]
-            current_priority = item_record.get("priority", "MEDIUM")
-            current_status = item_record.get("status", "OPEN")
-
-            with st.form(f"action_editor_{selected_item_id}"):
-                edited_assignee = st.text_input("Assignee", value=item_record.get("assignee", ""))
-                edited_description = st.text_area("Description", value=item_record.get("description", ""), height=130)
-                action_col_1, action_col_2 = st.columns(2)
-                with action_col_1:
-                    edited_deadline = st.text_input("Deadline", value=item_record.get("deadline", ""))
-                    edited_priority = st.selectbox(
-                        "Priority",
-                        priority_options,
-                        index=priority_options.index(current_priority) if current_priority in priority_options else 1,
-                    )
-                with action_col_2:
-                    edited_category = st.text_input("Category", value=item_record.get("category", "General"))
-                    edited_status = st.selectbox(
-                        "Status",
-                        status_options,
-                        index=status_options.index(current_status) if current_status in status_options else 0,
-                    )
-                delete_item_confirm = st.checkbox("I understand this will delete this action item")
-                save_item_changes = st.form_submit_button("Save action item changes", type="primary")
-                remove_item = st.form_submit_button("Delete action item")
-
-            if save_item_changes:
-                updates = {
-                    "assignee": edited_assignee,
-                    "description": edited_description,
-                    "deadline": edited_deadline,
-                    "priority": edited_priority,
-                    "category": edited_category,
-                    "status": edited_status,
-                    "meeting_id": item_record.get("meeting_id", ""),
-                    "created_at": item_record.get("created_at", ""),
+            action_rows = [
+                {
+                    "status": item.get("status", "OPEN"),
+                    "assignee": item.get("assignee", ""),
+                    "priority": item.get("priority", ""),
+                    "deadline": item.get("deadline", ""),
+                    "description": item.get("description", ""),
+                    "meeting_id": item.get("meeting_id", ""),
+                    "item_id": item.get("item_id", ""),
                 }
-                if update_action_item(selected_item_id, updates):
-                    st.success("Action item updated.")
-                    st.rerun()
-                else:
-                    st.error("Could not update action item.")
+                for item in action_items[:50]
+            ]
+            selected_item_from_table = None
+            action_table_key = f"action_items_table_{st.session_state.get('action_items_table_reset', 0)}"
+            action_table_event = st.dataframe(
+                action_rows,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="multi-row",
+                key=action_table_key,
+            )
+            selected_action_rows = action_table_event.selection.rows if action_table_event and action_table_event.selection else []
+            selected_action_rows = [
+                row_index
+                for row_index in selected_action_rows
+                if isinstance(row_index, int) and 0 <= row_index < len(action_rows)
+            ]
+            selected_item_ids = [
+                action_rows[row_index]["item_id"]
+                for row_index in selected_action_rows
+            ]
+            if selected_item_ids:
+                selected_item_from_table = selected_item_ids[0]
+                st.caption(f"{len(selected_item_ids)} action item record(s) selected.")
+            if len(action_items) > 50:
+                st.caption(f"Showing 50 of {len(action_items)} action items. Use the selected-meeting filter to narrow the list.")
 
-            if remove_item:
-                if not delete_item_confirm:
-                    st.warning("Tick the delete confirmation checkbox first.")
-                elif delete_action_item(selected_item_id):
-                    st.success("Action item deleted.")
-                    st.rerun()
+            item_delete_col, item_confirm_col = st.columns([0.3, 0.7])
+            with item_confirm_col:
+                selected_item_signature = abs(hash(tuple(selected_item_ids)))
+                bulk_delete_items_confirm = st.checkbox(
+                    "I understand this will delete the selected action item records",
+                    disabled=not selected_item_ids,
+                    key=f"bulk_delete_action_items_confirm_{selected_item_signature}",
+                )
+            with item_delete_col:
+                bulk_delete_items = st.button(
+                    f"Delete selected ({len(selected_item_ids)})",
+                    disabled=not selected_item_ids,
+                    key="bulk_delete_action_items",
+                )
+
+            if bulk_delete_items:
+                if not bulk_delete_items_confirm:
+                    st.warning("Tick the action-item delete confirmation checkbox first.")
                 else:
-                    st.error("Could not delete action item.")
+                    deleted_count = 0
+                    failed_ids = []
+                    for item_id in selected_item_ids:
+                        if delete_action_item(item_id):
+                            deleted_count += 1
+                        else:
+                            failed_ids.append(item_id)
+                    st.session_state["action_items_table_reset"] = (
+                        st.session_state.get("action_items_table_reset", 0) + 1
+                    )
+                    if st.session_state.get("data_manager_selected_item_id") in selected_item_ids:
+                        st.session_state.pop("data_manager_selected_item_id", None)
+                    if failed_ids:
+                        st.error(
+                            f"Deleted {deleted_count} action item record(s), but could not delete: {', '.join(failed_ids)}"
+                        )
+                    else:
+                        st.success(f"Deleted {deleted_count} action item record(s).")
+                    st.rerun()
+
+            if not selected_item_from_table:
+                st.info("Select an action item row from the table to edit or delete a single record.")
+                st.session_state.pop("data_manager_selected_item_id", None)
+            else:
+                selected_item_id = selected_item_from_table
+                st.session_state.data_manager_selected_item_id = selected_item_id
+                item_record = next(row for row in action_items if row["item_id"] == selected_item_id)
+
+                priority_options = ["HIGH", "MEDIUM", "LOW"]
+                current_priority = item_record.get("priority", "MEDIUM")
+                current_status = item_record.get("status", "OPEN") or "OPEN"
+                status_options = ["OPEN", "Not Started", "In Progress", "CLOSED"]
+                if current_status not in status_options:
+                    status_options.insert(0, current_status)
+
+                with st.form(f"action_editor_{selected_item_id}"):
+                    st.caption(f"Editing selected action item: {selected_item_id}")
+                    edited_assignee = st.text_input("Assignee", value=item_record.get("assignee", ""))
+                    edited_description = st.text_area("Description", value=item_record.get("description", ""), height=130)
+                    action_col_1, action_col_2 = st.columns(2)
+                    with action_col_1:
+                        edited_deadline = st.text_input("Deadline", value=item_record.get("deadline", ""))
+                        edited_priority = st.selectbox(
+                            "Priority",
+                            priority_options,
+                            index=priority_options.index(current_priority) if current_priority in priority_options else 1,
+                        )
+                    with action_col_2:
+                        edited_category = st.text_input("Category", value=item_record.get("category", "General"))
+                        edited_status = st.selectbox(
+                            "Status",
+                            status_options,
+                            index=status_options.index(current_status) if current_status in status_options else 0,
+                        )
+                    save_item_changes = st.form_submit_button("Save action item changes", type="primary")
+                    delete_item_col, delete_item_confirm_col = st.columns([0.28, 0.72])
+                    with delete_item_col:
+                        remove_item = st.form_submit_button("Delete action item")
+                    with delete_item_confirm_col:
+                        delete_item_confirm = st.checkbox("I understand this will delete this action item")
+
+                if save_item_changes:
+                    updates = {
+                        "assignee": edited_assignee,
+                        "description": edited_description,
+                        "deadline": edited_deadline,
+                        "priority": edited_priority,
+                        "category": edited_category,
+                        "status": edited_status,
+                        "meeting_id": item_record.get("meeting_id", ""),
+                        "created_at": item_record.get("created_at", ""),
+                    }
+                    if update_action_item(selected_item_id, updates):
+                        st.success("Action item updated.")
+                        st.rerun()
+                    else:
+                        st.error("Could not update action item.")
+
+                if remove_item:
+                    if not delete_item_confirm:
+                        st.warning("Tick the delete confirmation checkbox first.")
+                    elif delete_action_item(selected_item_id):
+                        st.session_state["action_items_table_reset"] = (
+                            st.session_state.get("action_items_table_reset", 0) + 1
+                        )
+                        st.session_state.pop("data_manager_selected_item_id", None)
+                        st.success("Action item deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Could not delete action item.")
