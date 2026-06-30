@@ -62,6 +62,7 @@ DATA_MANAGER_PAGE = "Data Manager"
 PAGES = [HOME_PAGE, LIVE_PAGE, BRIEFING_PAGE, ACTION_ITEMS_PAGE, DATA_MANAGER_PAGE]
 DEMO_SIMULATION_MODE = "Demo Simulation"
 MICROPHONE_AUDIO_MODE = "Microphone / Audio Input"
+SYSTEM_AUDIO_MODE = "Windows Loopback / Headset Output"
 
 
 def is_closed_action_status(status: str) -> bool:
@@ -250,6 +251,38 @@ def _system_loopback_devices(sc):
     return speaker, candidates
 
 
+def _system_microphone_devices(sc):
+    default_mic = sc.default_microphone()
+    candidates = []
+    seen = set()
+
+    def add_candidate(mic):
+        device_id = getattr(mic, "id", None) or getattr(mic, "name", "")
+        if device_id in seen:
+            return
+        seen.add(device_id)
+        candidates.append(mic)
+
+    if default_mic is not None:
+        add_candidate(default_mic)
+    for mic in sc.all_microphones(include_loopback=False):
+        if not getattr(mic, "isloopback", False):
+            add_candidate(mic)
+    return default_mic, candidates
+
+
+def _matching_audio_device(devices, preferred_device: str, fallback=None):
+    preferred_device = str(preferred_device or "").strip()
+    if preferred_device:
+        for device in devices:
+            if preferred_device in {
+                str(getattr(device, "name", "")),
+                str(getattr(device, "id", "")),
+            }:
+                return device
+    return fallback if fallback is not None else (devices[0] if devices else None)
+
+
 def _friendly_audio_error(exc: Exception) -> str:
     message = str(exc) or exc.__class__.__name__
     if "0x100000001" in message:
@@ -296,6 +329,14 @@ def _audio_is_silent(stats: dict) -> bool:
     )
 
 
+def _chunk_has_audio_signal(chunk) -> bool:
+    if chunk is None or not getattr(chunk, "size", 0):
+        return False
+    peak = float(np.max(np.abs(chunk)))
+    rms = float(np.sqrt(np.mean(np.square(chunk))))
+    return peak >= SILENT_AUDIO_PEAK_THRESHOLD or rms >= SILENT_AUDIO_RMS_THRESHOLD
+
+
 def _format_audio_signal_stats(stats: dict | None) -> str:
     if not stats:
         return "Signal level unavailable."
@@ -319,6 +360,37 @@ def _wav_bytes_from_samples(data, sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+def _as_stereo_float(data):
+    data = _prepare_audio_samples(data).astype(np.float32)
+    if data.shape[1] == 1:
+        return np.repeat(data, 2, axis=1)
+    return data[:, :2]
+
+
+def _mix_audio_tracks(tracks):
+    arrays = []
+    for data, gain in tracks:
+        if data is None or not getattr(data, "size", 0):
+            continue
+        arrays.append(_as_stereo_float(data) * float(gain))
+    if not arrays:
+        raise RuntimeError("No audio tracks were captured.")
+
+    max_len = max(array.shape[0] for array in arrays)
+    padded = []
+    for array in arrays:
+        if array.shape[0] < max_len:
+            pad = np.zeros((max_len - array.shape[0], array.shape[1]), dtype=np.float32)
+            array = np.vstack([array, pad])
+        padded.append(array)
+
+    mixed = np.sum(padded, axis=0)
+    peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+    if peak > 0.98:
+        mixed = mixed * (0.98 / peak)
+    return mixed.astype(np.float32)
+
+
 def _initialize_com_for_audio_thread() -> bool:
     result = ctypes.windll.ole32.CoInitializeEx(None, 0)
     if result in (0, 1):
@@ -331,19 +403,125 @@ def _initialize_com_for_audio_thread() -> bool:
 def get_system_audio_device_summary() -> dict:
     com_initialized = False
     try:
-        com_initialized = _initialize_com_for_audio_thread()
-        sc, _ = _import_soundcard_for_audio_thread()
+        sc, soundcard_already_loaded = _import_soundcard_for_audio_thread()
+        if soundcard_already_loaded:
+            com_initialized = _initialize_com_for_audio_thread()
         speaker, loopbacks = _system_loopback_devices(sc)
+        default_mic, microphones = _system_microphone_devices(sc)
         return {
             "speaker": getattr(speaker, "name", "default speaker"),
             "loopbacks": [getattr(loopback, "name", "system audio") for loopback in loopbacks],
+            "default_microphone": getattr(default_mic, "name", "default microphone") if default_mic else "",
+            "microphones": [getattr(mic, "name", "microphone") for mic in microphones],
             "error": "",
         }
     except Exception as exc:
-        return {"speaker": "", "loopbacks": [], "error": _friendly_audio_error(exc)}
+        return {"speaker": "", "loopbacks": [], "default_microphone": "", "microphones": [], "error": _friendly_audio_error(exc)}
     finally:
         if com_initialized:
             ctypes.windll.ole32.CoUninitialize()
+
+
+def _record_loopback_track(sc, job: dict, sample_rate: int, chunk_frames: int) -> dict:
+    speaker, loopbacks = _system_loopback_devices(sc)
+    preferred_device = str(job.get("preferred_device", "")).strip()
+    loopback = _matching_audio_device(loopbacks, preferred_device)
+    errors = []
+    chunks = None
+    device_name = getattr(speaker, "name", "default speaker")
+
+    if preferred_device or len(loopbacks) == 1:
+        if loopback is None:
+            return {"error": "No matching Windows output loopback device was found."}
+        device_name = getattr(loopback, "name", device_name)
+        job["device"] = device_name
+        chunks = []
+        try:
+            while not job["stop_event"].is_set():
+                chunk = loopback.record(samplerate=sample_rate, numframes=chunk_frames)
+                chunks.append(chunk)
+                job["loopback_peak"] = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+                job["last_peak"] = job["loopback_peak"]
+        except Exception as exc:
+            errors.append(f"{device_name}: {_friendly_audio_error(exc)}")
+            chunks = None
+    else:
+        scan_chunks_by_device = {}
+        active_loopback = None
+        active_chunks = []
+
+        while not job["stop_event"].is_set() and active_loopback is None:
+            for candidate in loopbacks:
+                if job["stop_event"].is_set():
+                    break
+                candidate_name = getattr(candidate, "name", "Windows output")
+                job["device"] = f"Auto-scanning: {candidate_name}"
+                try:
+                    chunk = candidate.record(samplerate=sample_rate, numframes=chunk_frames)
+                except Exception as exc:
+                    errors.append(f"{candidate_name}: {_friendly_audio_error(exc)}")
+                    continue
+
+                scan_chunks_by_device.setdefault(candidate_name, []).append(chunk)
+                job["loopback_peak"] = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+                job["last_peak"] = job["loopback_peak"]
+                if _chunk_has_audio_signal(chunk):
+                    active_loopback = candidate
+                    active_chunks = [chunk]
+                    device_name = candidate_name
+                    job["device"] = device_name
+                    break
+
+        if active_loopback is not None:
+            chunks = active_chunks
+            try:
+                while not job["stop_event"].is_set():
+                    chunk = active_loopback.record(samplerate=sample_rate, numframes=chunk_frames)
+                    chunks.append(chunk)
+                    job["loopback_peak"] = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+                    job["last_peak"] = job["loopback_peak"]
+            except Exception as exc:
+                errors.append(f"{device_name}: {_friendly_audio_error(exc)}")
+                chunks = None
+        elif scan_chunks_by_device:
+            device_name, chunks = max(
+                scan_chunks_by_device.items(),
+                key=lambda item: max(
+                    (float(np.max(np.abs(chunk))) for chunk in item[1] if getattr(chunk, "size", 0)),
+                    default=0.0,
+                ),
+            )
+            job["device"] = device_name
+
+    if not chunks:
+        return {"error": " ".join(errors).strip() or "No Windows output audio was captured."}
+
+    data = np.concatenate(chunks, axis=0)
+    return {"device": device_name, "data": data, "stats": _audio_signal_stats(data, sample_rate)}
+
+
+def _record_microphone_track(sc, job: dict, sample_rate: int, chunk_frames: int) -> dict:
+    default_mic, microphones = _system_microphone_devices(sc)
+    mic = _matching_audio_device(microphones, job.get("preferred_microphone", ""), default_mic)
+    if mic is None:
+        return {"error": "No microphone device was found."}
+
+    device_name = getattr(mic, "name", "microphone")
+    job["microphone_device"] = device_name
+    chunks = []
+    try:
+        while not job["stop_event"].is_set():
+            chunk = mic.record(samplerate=sample_rate, numframes=chunk_frames)
+            chunks.append(chunk)
+            job["microphone_peak"] = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+    except Exception as exc:
+        return {"device": device_name, "error": _friendly_audio_error(exc)}
+
+    if not chunks:
+        return {"device": device_name, "error": "No microphone audio was captured."}
+
+    data = np.concatenate(chunks, axis=0)
+    return {"device": device_name, "data": data, "stats": _audio_signal_stats(data, sample_rate)}
 
 
 def _system_audio_worker(job: dict, sample_rate: int = 48000):
@@ -353,47 +531,72 @@ def _system_audio_worker(job: dict, sample_rate: int = 48000):
         if soundcard_already_loaded:
             com_initialized = _initialize_com_for_audio_thread()
 
-        speaker, loopbacks = _system_loopback_devices(sc)
-        job["device"] = getattr(speaker, "name", "default speaker")
-        chunks = None
-        errors = []
         chunk_frames = sample_rate // 2
+        include_microphone = bool(job.get("include_microphone"))
+        results = {}
 
-        for loopback in loopbacks:
-            job["device"] = getattr(loopback, "name", job["device"])
-            chunks = []
-            try:
-                while not job["stop_event"].is_set():
-                    chunk = loopback.record(samplerate=sample_rate, numframes=chunk_frames)
-                    chunks.append(chunk)
-                    job["last_peak"] = float(np.max(np.abs(chunk))) if chunk.size else 0.0
-                    job["frames_captured"] = int(sum(part.shape[0] for part in chunks if part.size))
-                break
-            except Exception as exc:
-                errors.append(f"{job['device']}: {_friendly_audio_error(exc)}")
-                chunks = None
-                if job["stop_event"].is_set():
-                    break
+        if include_microphone:
+            threads = [
+                threading.Thread(
+                    target=lambda: results.update(loopback=_record_loopback_track(sc, job, sample_rate, chunk_frames)),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=lambda: results.update(microphone=_record_microphone_track(sc, job, sample_rate, chunk_frames)),
+                    daemon=True,
+                ),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        else:
+            results["loopback"] = _record_loopback_track(sc, job, sample_rate, chunk_frames)
 
-        if not chunks:
-            detail = " ".join(errors).strip()
-            if detail:
-                raise RuntimeError(f"System audio recording failed. {detail}")
-            raise RuntimeError("No system audio was captured.")
+        loopback_result = results.get("loopback", {})
+        microphone_result = results.get("microphone", {})
+        tracks = []
+        track_stats = {}
+        warnings = []
 
-        data = np.concatenate(chunks, axis=0)
+        if loopback_result.get("data") is not None:
+            tracks.append((loopback_result["data"], 1.0))
+            track_stats["loopback"] = loopback_result.get("stats", {})
+            job["device"] = loopback_result.get("device", job.get("device", "Windows output"))
+            if _audio_is_silent(loopback_result.get("stats", {})):
+                warnings.append("Windows output track was silent.")
+        elif loopback_result.get("error"):
+            warnings.append(f"Windows output track: {loopback_result['error']}")
+
+        if include_microphone:
+            if microphone_result.get("data") is not None:
+                tracks.append((microphone_result["data"], 2.0))
+                track_stats["microphone"] = microphone_result.get("stats", {})
+                job["microphone_device"] = microphone_result.get("device", "")
+                if _audio_is_silent(microphone_result.get("stats", {})):
+                    warnings.append("Microphone track was silent.")
+            elif microphone_result.get("error"):
+                warnings.append(f"Microphone track: {microphone_result['error']}")
+
+        if not tracks:
+            raise RuntimeError("No loopback or microphone audio was captured.")
+
+        data = _mix_audio_tracks(tracks)
         stats = _audio_signal_stats(data, sample_rate)
         job["signal_stats"] = stats
+        job["track_stats"] = track_stats
+        if warnings:
+            job["warning"] = " ".join(warnings)
         if _audio_is_silent(stats):
             job["error"] = (
-                f"No system audio signal was detected from {job['device']}. "
-                "Make sure the meeting audio is playing through this Windows output device, "
-                "then record again."
+                "No usable audio signal was detected. Make sure Teams audio is playing through the selected "
+                "Windows output device and your microphone is not muted."
             )
             job["status"] = "silent"
             return
+
         job["bytes"] = _wav_bytes_from_samples(data, sample_rate)
-        job["name"] = "system_audio_recording.wav"
+        job["name"] = "teams_loopback_plus_mic_recording.wav" if include_microphone else "system_audio_recording.wav"
         job["status"] = "complete"
     except Exception as exc:
         job["error"] = _friendly_audio_error(exc)
@@ -404,10 +607,17 @@ def _system_audio_worker(job: dict, sample_rate: int = 48000):
         job["finished_event"].set()
 
 
-def start_system_audio_recording() -> dict:
+def start_system_audio_recording(
+    preferred_device: str = "",
+    include_microphone: bool = False,
+    preferred_microphone: str = "",
+) -> dict:
     job = {
         "status": "recording",
         "device": "",
+        "preferred_device": preferred_device,
+        "include_microphone": include_microphone,
+        "preferred_microphone": preferred_microphone,
         "started_at": time.time(),
         "stop_event": threading.Event(),
         "finished_event": threading.Event(),
@@ -1449,7 +1659,7 @@ elif page == LIVE_PAGE:
                 MeetingOps turns the discussion into an English transcript, summary, and saved action items.
             </p>
             <div class="live-status-grid">
-                <div class="live-status"><b>Input</b><span>Demo, microphone, or uploaded audio.</span></div>
+                <div class="live-status"><b>Input</b><span>Demo, microphone, upload, or Windows loopback audio.</span></div>
                 <div class="live-status"><b>AI pass</b><span>Diarize, translate, summarize, and extract owners.</span></div>
                 <div class="live-status"><b>Output</b><span>Saved meeting record with pending follow-ups.</span></div>
             </div>
@@ -1515,7 +1725,7 @@ elif page == LIVE_PAGE:
             """,
             unsafe_allow_html=True,
         )
-        mode = st.radio("Mode", [DEMO_SIMULATION_MODE, MICROPHONE_AUDIO_MODE], horizontal=True)
+        mode = st.radio("Mode", [DEMO_SIMULATION_MODE, MICROPHONE_AUDIO_MODE, SYSTEM_AUDIO_MODE], horizontal=True)
 
     if mode == DEMO_SIMULATION_MODE:
         st.markdown('<div class="live-section-title">Demo Transcript Preview</div>', unsafe_allow_html=True)
@@ -1584,6 +1794,141 @@ elif page == LIVE_PAGE:
             audio = None
 
         run = st.button("Process Audio", type="primary", disabled=audio is None and not use_manual_transcript)
+    elif mode == SYSTEM_AUDIO_MODE:
+        st.markdown('<div class="live-section-title">Capture Input</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="live-section-copy">Experimentally record the Windows audio you hear from your headset or speakers.</div>',
+            unsafe_allow_html=True,
+        )
+        st.warning(
+            "Experimental: this can mix Windows output audio with your microphone. "
+            "For Teams, select the Speaker output that carries your colleague voice, and keep microphone mixing enabled for your voice."
+        )
+        audio = None
+        manual_transcript = ""
+        use_manual_transcript = False
+
+        active_job = st.session_state.get("system_audio_job")
+        is_recording = bool(active_job and active_job.get("status") == "recording")
+        device_summary = get_system_audio_device_summary()
+        preferred_loopback_device = ""
+        preferred_microphone = ""
+        include_loopback_microphone = True
+
+        if device_summary.get("error"):
+            st.error(device_summary["error"])
+        else:
+            st.caption(f"Default Windows output: {device_summary.get('speaker', 'default speaker')}")
+            st.caption(f"Default microphone: {device_summary.get('default_microphone', 'default microphone')}")
+            loopback_options = device_summary.get("loopbacks", [])
+            if loopback_options:
+                selected_loopback = st.selectbox(
+                    "Windows output device to record",
+                    ["Auto-detect active Windows output"] + loopback_options,
+                    disabled=is_recording,
+                )
+                preferred_loopback_device = "" if selected_loopback.startswith("Auto-detect") else selected_loopback
+                st.caption(
+                    "Tip: Auto scans detected output devices. For the safest Teams test, select the exact Speaker device used in Teams."
+                )
+            else:
+                st.error("No Windows loopback output devices were found.")
+
+            include_loopback_microphone = st.checkbox(
+                "Also record my microphone for my side of the call",
+                value=True,
+                disabled=is_recording,
+            )
+            if include_loopback_microphone:
+                microphone_options = device_summary.get("microphones", [])
+                if microphone_options:
+                    selected_microphone = st.selectbox(
+                        "Microphone to mix with loopback audio",
+                        ["Auto: default microphone"] + microphone_options,
+                        disabled=is_recording,
+                    )
+                    preferred_microphone = "" if selected_microphone.startswith("Auto:") else selected_microphone
+                else:
+                    st.error("No microphone devices were found for your side of the call.")
+
+        record_col, stop_col = st.columns(2)
+        with record_col:
+            if st.button(
+                "Start Teams Audio Recording",
+                type="primary",
+                disabled=is_recording or bool(device_summary.get("error")),
+            ):
+                st.session_state.pop("system_audio_recording", None)
+                st.session_state.system_audio_job = start_system_audio_recording(
+                    preferred_device=preferred_loopback_device,
+                    include_microphone=include_loopback_microphone,
+                    preferred_microphone=preferred_microphone,
+                )
+                st.rerun()
+        with stop_col:
+            if st.button("Stop Teams Audio Recording", disabled=not is_recording):
+                try:
+                    stopped_job = stop_system_audio_recording(active_job)
+                    if stopped_job.get("status") == "complete":
+                        st.session_state.system_audio_recording = {
+                            "bytes": stopped_job["bytes"],
+                            "name": stopped_job["name"],
+                            "device": stopped_job.get("device", "default speaker"),
+                            "microphone_device": stopped_job.get("microphone_device", ""),
+                            "include_microphone": stopped_job.get("include_microphone", False),
+                            "signal_stats": stopped_job.get("signal_stats", {}),
+                            "track_stats": stopped_job.get("track_stats", {}),
+                            "warning": stopped_job.get("warning", ""),
+                        }
+                        st.session_state.pop("system_audio_job", None)
+                    else:
+                        st.error(stopped_job.get("error", "Teams audio recording failed."))
+                        if stopped_job.get("signal_stats"):
+                            st.caption(_format_audio_signal_stats(stopped_job["signal_stats"]))
+                except Exception as exc:
+                    st.error(str(exc))
+                st.rerun()
+
+        if is_recording:
+            elapsed = int(time.time() - active_job.get("started_at", time.time()))
+            device_label = active_job.get("device") or active_job.get("preferred_device") or "Windows output"
+            loopback_peak = active_job.get("loopback_peak")
+            mic_peak = active_job.get("microphone_peak")
+            level_parts = []
+            if loopback_peak is not None:
+                level_parts.append(f"output peak {loopback_peak:.5f}")
+            if mic_peak is not None:
+                level_parts.append(f"mic peak {mic_peak:.5f}")
+            level_text = " " + ", ".join(level_parts) + "." if level_parts else ""
+            st.warning(
+                f"Recording {device_label}... {elapsed} seconds.{level_text} "
+                "Ask the other person to speak, speak once yourself, then stop and preview the recording."
+            )
+        elif active_job and active_job.get("status") in {"error", "silent"}:
+            st.error(active_job.get("error", "Teams audio recording failed."))
+            if active_job.get("signal_stats"):
+                st.caption(_format_audio_signal_stats(active_job["signal_stats"]))
+            st.session_state.pop("system_audio_job", None)
+
+        recorded_system_audio = st.session_state.get("system_audio_recording")
+        if recorded_system_audio:
+            audio = RecordedAudio(recorded_system_audio["bytes"], recorded_system_audio["name"])
+            success_text = f"Teams audio ready from {recorded_system_audio.get('device', 'Windows output')}"
+            if recorded_system_audio.get("microphone_device"):
+                success_text += f" + {recorded_system_audio['microphone_device']}"
+            st.success(success_text + ".")
+            st.caption("Mixed audio: " + _format_audio_signal_stats(recorded_system_audio.get("signal_stats")))
+            track_stats = recorded_system_audio.get("track_stats", {})
+            if track_stats.get("loopback"):
+                st.caption("Output track: " + _format_audio_signal_stats(track_stats["loopback"]))
+            if track_stats.get("microphone"):
+                st.caption("Microphone track: " + _format_audio_signal_stats(track_stats["microphone"]))
+            if recorded_system_audio.get("warning"):
+                st.warning(recorded_system_audio["warning"])
+            st.audio(recorded_system_audio["bytes"], format="audio/wav")
+            st.info("Preview the audio above. If you hear both sides clearly, click Process Teams Audio.")
+
+        run = st.button("Process Teams Audio", type="primary", disabled=audio is None or is_recording)
     if run:
         progress = st.progress(0)
         status = st.empty()
@@ -1975,6 +2320,11 @@ elif page == DATA_MANAGER_PAGE:
                 meeting_rows[row_index]["meeting_id"]
                 for row_index in selected_rows
             ]
+            if selected_meeting_ids:
+                st.session_state.data_manager_selected_meeting_ids = selected_meeting_ids
+            else:
+                st.session_state.pop("data_manager_selected_meeting_ids", None)
+                st.session_state.pop("data_manager_selected_meeting_id", None)
             if selected_rows:
                 selected_from_table = meeting_rows[selected_rows[0]]["meeting_id"]
             if len(visible_meetings) > 25:
@@ -2013,6 +2363,7 @@ elif page == DATA_MANAGER_PAGE:
                     )
                     if st.session_state.get("data_manager_selected_meeting_id") in selected_meeting_ids:
                         st.session_state.pop("data_manager_selected_meeting_id", None)
+                    st.session_state.pop("data_manager_selected_meeting_ids", None)
                     if failed_ids:
                         st.error(
                             f"Deleted {deleted_count} meeting record(s), but could not delete: {', '.join(failed_ids)}"
@@ -2079,15 +2430,23 @@ elif page == DATA_MANAGER_PAGE:
             unsafe_allow_html=True,
         )
 
-        selected_meeting_for_items = st.session_state.get("data_manager_selected_meeting_id")
-        selected_meeting_for_items_title = next(
-            (
-                meeting.get("meeting_title") or selected_meeting_for_items
-                for meeting in meetings
-                if meeting.get("meeting_id") == selected_meeting_for_items
-            ),
-            selected_meeting_for_items,
-        )
+        selected_meeting_ids_for_items = [
+            meeting_id
+            for meeting_id in st.session_state.get("data_manager_selected_meeting_ids", [])
+            if meeting_id
+        ]
+        if not selected_meeting_ids_for_items and st.session_state.get("data_manager_selected_meeting_id"):
+            selected_meeting_ids_for_items = [st.session_state.data_manager_selected_meeting_id]
+        selected_meeting_ids_for_items = [
+            meeting_id
+            for meeting_id in selected_meeting_ids_for_items
+            if any(meeting.get("meeting_id") == meeting_id for meeting in meetings)
+        ]
+        selected_meeting_titles = [
+            meeting.get("meeting_title") or meeting.get("meeting_id", "")
+            for meeting in meetings
+            if meeting.get("meeting_id") in selected_meeting_ids_for_items
+        ]
         action_status_filter = st.radio(
             "Action item status",
             ["All", "Active only", "Closed only"],
@@ -2095,9 +2454,9 @@ elif page == DATA_MANAGER_PAGE:
             key="data_manager_action_status_filter",
         )
         filter_to_selected_meeting = st.checkbox(
-            "Only show action items for the selected meeting",
-            value=bool(selected_meeting_for_items),
-            disabled=not bool(selected_meeting_for_items),
+            "Only show action items for selected meeting(s)",
+            value=bool(selected_meeting_ids_for_items),
+            disabled=not bool(selected_meeting_ids_for_items),
         )
         action_items = list_action_items(include_closed=True)
         if action_status_filter == "Active only":
@@ -2112,23 +2471,34 @@ elif page == DATA_MANAGER_PAGE:
                 for item in action_items
                 if is_closed_action_status(item.get("status", "OPEN"))
             ]
-        if filter_to_selected_meeting and selected_meeting_for_items:
+        if filter_to_selected_meeting and selected_meeting_ids_for_items:
+            selected_meeting_id_set = set(selected_meeting_ids_for_items)
             action_items = [
                 item
                 for item in action_items
-                if item.get("meeting_id") == selected_meeting_for_items
+                if item.get("meeting_id") in selected_meeting_id_set
             ]
-            st.caption(
-                f"Showing action items linked to: {selected_meeting_for_items_title} ({selected_meeting_for_items})"
-            )
-        elif selected_meeting_for_items:
-            st.caption(
-                f"Selected meeting: {selected_meeting_for_items_title} ({selected_meeting_for_items}). Toggle the filter above to show only its action items."
-            )
+            if len(selected_meeting_ids_for_items) == 1:
+                selected_title = selected_meeting_titles[0] if selected_meeting_titles else selected_meeting_ids_for_items[0]
+                st.caption(f"Showing action items linked to: {selected_title} ({selected_meeting_ids_for_items[0]})")
+            else:
+                st.caption(f"Showing action items linked to {len(selected_meeting_ids_for_items)} selected meetings.")
+        elif selected_meeting_ids_for_items:
+            if len(selected_meeting_ids_for_items) == 1:
+                selected_title = selected_meeting_titles[0] if selected_meeting_titles else selected_meeting_ids_for_items[0]
+                st.caption(
+                    f"Selected meeting: {selected_title} ({selected_meeting_ids_for_items[0]}). "
+                    "Toggle the filter above to show only its action items."
+                )
+            else:
+                st.caption(
+                    f"{len(selected_meeting_ids_for_items)} meetings selected. "
+                    "Toggle the filter above to show action items from those meetings."
+                )
 
         if not action_items:
-            if filter_to_selected_meeting and selected_meeting_for_items:
-                st.info("No action items are linked to the selected meeting.")
+            if filter_to_selected_meeting and selected_meeting_ids_for_items:
+                st.info("No action items are linked to the selected meeting(s).")
             elif action_status_filter == "Closed only":
                 st.info("No closed action items found.")
             elif action_status_filter == "Active only":
