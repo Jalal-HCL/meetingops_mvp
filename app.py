@@ -1653,8 +1653,13 @@ if page == HOME_PAGE:
         )
 
 elif page == LIVE_PAGE:
+    live_input_copy = (
+        "Demo, microphone, upload, or Windows loopback audio."
+        if supports_system_audio_mode()
+        else "Demo, microphone, upload, or transcript fallback."
+    )
     st.markdown(
-        """
+        f"""
         <div class="live-hero">
             <div class="live-kicker">Live meeting workspace</div>
             <h1 class="live-title">Capture the call. <span>Leave with action.</span></h1>
@@ -1663,7 +1668,7 @@ elif page == LIVE_PAGE:
                 MeetingOps turns the discussion into an English transcript, summary, and saved action items.
             </p>
             <div class="live-status-grid">
-                <div class="live-status"><b>Input</b><span>Demo, microphone, upload, or Windows loopback audio.</span></div>
+                <div class="live-status"><b>Input</b><span>{live_input_copy}</span></div>
                 <div class="live-status"><b>AI pass</b><span>Diarize, translate, summarize, and extract owners.</span></div>
                 <div class="live-status"><b>Output</b><span>Saved meeting record with pending follow-ups.</span></div>
             </div>
