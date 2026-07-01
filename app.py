@@ -1368,6 +1368,7 @@ def logout():
         "live_meeting_source",
         "pending_page",
         "microphone_recording",
+        "live_native_audio_input",
         "live_mic_recorder_output",
         "system_audio_recording",
         "system_audio_job",
@@ -1764,14 +1765,31 @@ elif page == LIVE_PAGE:
             '<div class="live-section-copy">Record browser microphone audio or upload a saved recording.</div>',
             unsafe_allow_html=True,
         )
-        st.info("For live room audio, allow microphone access in Edge/Chrome for localhost. For Teams/Meet audio, upload a recording if browser microphone capture is blocked.")
+        st.info(
+            "For live room audio, allow microphone access in Edge/Chrome for this site. "
+            "If the recorder does not start, click the lock icon in the address bar, allow Microphone, then refresh. "
+            "For Teams/Meet audio, upload a recording if browser microphone capture is blocked."
+        )
         audio = None
         manual_transcript = ""
         use_manual_transcript = False
 
-        if mic_recorder is None:
-            st.warning("Microphone recorder package is not installed. Upload audio to continue.")
+        if hasattr(st, "audio_input"):
+            native_audio = st.audio_input(
+                "Record meeting audio",
+                key="live_native_audio_input",
+                sample_rate=16000,
+            )
+            if native_audio is not None:
+                native_audio_name = getattr(native_audio, "name", None) or "microphone_recording.wav"
+                st.session_state.microphone_recording = {
+                    "bytes": native_audio.getvalue(),
+                    "name": native_audio_name,
+                }
+        elif mic_recorder is None:
+            st.warning("Microphone recorder is not available. Upload audio to continue.")
         else:
+            st.caption("Fallback recorder")
             mic_audio = mic_recorder(
                 start_prompt="Record meeting audio",
                 stop_prompt="Stop recording",
