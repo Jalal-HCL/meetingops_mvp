@@ -65,6 +65,10 @@ MICROPHONE_AUDIO_MODE = "Microphone / Audio Input"
 SYSTEM_AUDIO_MODE = "Windows Loopback / Headset Output"
 
 
+def supports_system_audio_mode() -> bool:
+    return sys.platform.startswith("win")
+
+
 def is_closed_action_status(status: str) -> bool:
     return str(status or "").strip().upper() in {"CLOSED", "DONE", "COMPLETE", "COMPLETED"}
 
@@ -1725,7 +1729,18 @@ elif page == LIVE_PAGE:
             """,
             unsafe_allow_html=True,
         )
-        mode = st.radio("Mode", [DEMO_SIMULATION_MODE, MICROPHONE_AUDIO_MODE, SYSTEM_AUDIO_MODE], horizontal=True)
+        mode_options = [DEMO_SIMULATION_MODE, MICROPHONE_AUDIO_MODE]
+        if supports_system_audio_mode():
+            mode_options.append(SYSTEM_AUDIO_MODE)
+        elif st.session_state.get("live_capture_mode") == SYSTEM_AUDIO_MODE:
+            st.session_state.live_capture_mode = DEMO_SIMULATION_MODE
+
+        mode = st.radio("Mode", mode_options, horizontal=True, key="live_capture_mode")
+        if not supports_system_audio_mode():
+            st.caption(
+                "Windows loopback/headset capture is available only in the local Windows app. "
+                "The hosted cloud link supports demo, microphone, upload, and transcript fallback."
+            )
 
     if mode == DEMO_SIMULATION_MODE:
         st.markdown('<div class="live-section-title">Demo Transcript Preview</div>', unsafe_allow_html=True)
